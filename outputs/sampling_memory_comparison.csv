@@ -1,0 +1,8 @@
+method,n,k,peak_memory_bytes
+full_history_baseline,10048,,80440
+heap,10048,10.0,3552
+heap,10048,50.0,5456
+heap,10048,100.0,8288
+reservoir,10048,10.0,3332
+reservoir,10048,50.0,3620
+reservoir,10048,100.0,4068

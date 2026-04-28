@@ -1,0 +1,6 @@
+metric,value
+n_tickers,8.0
+avg_vol_ratio,0.9245556242451114
+max_topk_baseline_dev,0.0
+n_alerts,96.0
+alert_topk_overlap,10.0
