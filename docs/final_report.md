@@ -3,6 +3,13 @@
 **ORIE 5270 – Final Project**
 Cornell University, Spring 2026
 
+> **Scope.** This report describes streaming algorithms (sampling, rolling
+> volatility, extreme-event detection, top-k tracking) implemented on top
+> of a real equity dataset. **It is not a stock-prediction or trading-
+> strategy project**: no forecasts, signals, or returns are generated.
+> The full-history baseline is used purely as a reference for verifying
+> that streaming outputs behave consistently with the underlying data.
+
 ---
 
 ## Chapter 1. Introduction
@@ -30,10 +37,11 @@ reads each observation once and supports five streaming building blocks:
 5. **Top-`k` extreme-return tracking** — maintain a running top-`k` of the
    largest absolute returns using a min-heap.
 
-A full-history baseline is computed in parallel so every streaming result
-can be validated against the complete dataset. The deliverable is a Python
-package (`stock_stream`) with a reproducible one-command pipeline,
-38 unit tests, and 85 % branch coverage.
+A full-history baseline is computed in parallel as a reference for
+checking that selected streaming outputs (per-ticker volatility, the
+top-k absolute returns) behave consistently with the underlying data.
+The deliverable is a Python package (`stock_stream`) with a reproducible
+one-command pipeline, 38 unit tests, and 85 % branch coverage.
 
 ---
 
@@ -151,6 +159,27 @@ recomputed for every new arrival. Each post-window arrival emits a
 threshold, is_extreme)`. Per-ticker independence ensures volatilities are
 not contaminated across firms.
 
+#### Volatility-window convention
+
+Two natural designs exist:
+
+1. **State-after-event** (the convention used here). Append the new
+   return to the window first, then recompute volatility, then evaluate
+   the rule. The volatility used for the rule includes the current
+   return. The snapshot is interpreted as *the state of the monitor
+   after processing this event*.
+2. **State-before-event** ("leave-one-out"). Use only the previous
+   window to score the current return; update the window afterwards.
+
+Design 2 is sometimes preferred for anomaly-detection writeups because
+the score is independent of the value being scored. Design 1 is simpler
+and is the convention adopted by `OnlineMonitor`. With `window_size = 20`
+and `threshold = 3 σ`, the two designs disagree on at most a handful of
+events near the boundary; the substantive findings (e.g. the META
+2022-02-03 and ORCL 2025-09-10 alerts) are unchanged. Switching
+conventions would require swapping two lines in `monitoring.py:update`
+and is a clean extension rather than a bug fix.
+
 ### 4.6 Extreme-Return Event Detection
 
 A snapshot is flagged as **extreme** when
@@ -233,19 +262,24 @@ layer (`data_loader`, `stream`) and the algorithmic layer (`reservoir`,
 
 ## Chapter 6. Experiments
 
-### 6.1 Sampling correctness
+### 6.1 Empirical sampling check
 
-For each method (reservoir / heap), we run 500 independent samples of
-size `k = 50` over the cleaned stream of length `N = 10 048` and count
-how often each observation is selected.
+Both reservoir and heap sampling are *randomized* algorithms; their
+guarantee is at the level of the inclusion *distribution*, not on any
+single run. To check this empirically, for each method we run 500
+independent samples of size `k = 50` over the cleaned stream of length
+`N = 10 048` and count how often each observation is selected.
 
 | Method | `k / N` (theory) | mean selection prob (empirical) | std of per-item prob |
-|--------|------------------|----------------------------------|----------------------|
+|---|---:|---:|---:|
 | Reservoir | 0.004976 | 0.004976 | 0.003155 |
 | Heap | 0.004976 | 0.004976 | 0.003110 |
 
-Both empirical means hit the theoretical value exactly to six decimals,
-and the per-item std is consistent with finite-sample binomial noise.
+Both empirical means match the theoretical value to six decimals, and
+the per-item standard deviation is consistent with the finite-sample
+binomial noise that a uniform sampler would produce. This is consistent
+with — but, by construction, not a *proof* of — uniformity; the formal
+guarantees come from the inductive arguments sketched in the lecture.
 
 Outputs: `sampling_correctness_frequencies.csv`,
 `sampling_correctness_summary.csv`.
@@ -393,9 +427,10 @@ laptop.
 
 ## Chapter 8. Results
 
-1. **Sampling is correct and cheap.** Both reservoir and heap sampling
-   match the theoretical inclusion probability `k/N` to six decimals, and
-   both use 20–25× less memory than the full-history baseline.
+1. **Sampling is empirically uniform and cheap.** Across 500 runs, both
+   reservoir and heap sampling match the theoretical inclusion
+   probability `k/N` to six decimals, and both use 20–25× less memory
+   than the full-history baseline.
 2. **Heap is faster in practice, reservoir is leaner.** At `N = 10 000`
    the heap sampler is roughly 4× faster in wall-clock terms despite a
    larger asymptotic constant; reservoir keeps a smaller and slower-growing
@@ -405,9 +440,12 @@ laptop.
    the NVDA 2023-05-25 guidance beat, and the ORCL 2025-09-10 cloud-AI
    surprise — every one of these is a real news event that triggered a
    ≥ 3σ daily move.
-4. **Top-`k` is exact.** The bounded heap recovers the global top-10
-   absolute-return events with **zero** deviation from the full-history
-   baseline, while using O(`k`) instead of O(`N`) memory.
+4. **Top-`k` matches the baseline.** The bounded heap recovers the same
+   10 largest absolute-return events as the full-history baseline (zero
+   deviation across the five tickers contributing to the global top 10),
+   while using O(`k`) instead of O(`N`) memory. Note that this is a
+   *deterministic* selection rule, not a randomized sampler, so an exact
+   match is the expected outcome.
 5. **Average rolling volatility runs ≈ 8 % below baseline volatility.**
    This is consistent with the sliding window under-weighting rare,
    full-period shocks.
@@ -435,14 +473,18 @@ laptop.
 ## Chapter 10. Conclusion
 
 The project closes the loop between the lecture material on data streams
-and a real, reproducible quantitative-finance pipeline. We implemented
-both classical streaming-sampling algorithms, a per-ticker rolling-
-volatility monitor, an adaptive extreme-return alert rule, and a bounded
+and a reproducible quantitative-finance pipeline that is *not* a
+prediction or trading system: every component is a streaming data-
+structure exercise applied to real equity data. We implemented both
+classical streaming-sampling algorithms, a per-ticker rolling-volatility
+monitor, a threshold-based extreme-return alert rule, and a bounded
 top-`k` tracker, all on top of a single `StreamItem` interface. The
-streaming algorithms are correct (matching theoretical inclusion
-probabilities and recovering the exact full-history top-10) and
-substantially cheaper in memory than the baseline, validating the
-data-stream paradigm on five years of real U.S. equity data. The package
+randomized samplers behave empirically as the theory predicts (mean
+inclusion probability matches `k/N` to six decimals over 500 runs); the
+deterministic top-`k` tracker recovers the same global top-10 events as
+the full-history baseline; and all four streaming components run in
+memory bounded by `k` or `window_size` rather than by `N`, validating
+the data-stream paradigm on five years of U.S. equity data. The package
 ships with 38 unit tests and 85 % branch coverage, and the entire
 deliverable can be regenerated with a single command from raw inputs.
 
