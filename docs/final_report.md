@@ -1,92 +1,98 @@
 # Streaming Sampling and Event Monitoring for Financial Time Series
 
-**ORIE 5270 – Final Project**
-Cornell University, Spring 2026
+ORIE 5270 final project, Cornell University, Spring 2026.
 
-> **Scope.** This report describes streaming algorithms (sampling, rolling
-> volatility, extreme-event detection, top-k tracking) implemented on top
-> of a real equity dataset. **It is not a stock-prediction or trading-
-> strategy project**: no forecasts, signals, or returns are generated.
-> The full-history baseline is used purely as a reference for verifying
-> that streaming outputs behave consistently with the underlying data.
+The remainder of this report proceeds as follows. Chapter 1 sets out
+the motivation and the boundaries of the project. Chapters 2 and 3
+describe the dataset and formalise the stream interface that decouples
+the data from the algorithms. Chapter 4 explains the five streaming
+components in detail, together with the full-history baseline against
+which they are compared. Chapter 5 describes the implementation,
+including the package layout and the entry-point scripts. Chapter 6
+reports the empirical experiments. Chapter 7 documents the test suite
+and the coverage measurement. Chapter 8 summarises the substantive
+findings, Chapter 9 records the limitations, and Chapter 10 returns
+to the original question of how far the streaming paradigm is
+worthwhile in this setting.
 
----
+A note on scope is required at the outset. This project is a
+streaming-algorithms exercise applied to a real equity dataset; it is
+not a forecasting model, a portfolio-construction strategy, or a
+trading system. No prediction, signal, or simulated return is produced
+at any point in the pipeline. The full-history baseline that the
+package also computes serves only as a reference against which a small
+number of streaming outputs—per-ticker volatility and the top-k
+absolute returns—can be compared.
 
 ## Chapter 1. Introduction
 
-When a quantitative analyst receives market data, the data does not arrive
-all at once: prices stream in trade-by-trade, minute-by-minute, day-by-day.
-Two practical pressures appear immediately. First, the stream may be too
-long to keep in memory. Second, downstream consumers — risk monitors,
-alerting systems, dashboards — must update *continuously* and cannot wait
-for the stream to end. These constraints match exactly the data-stream
-paradigm covered in lecture (W7D2 *Data Streams*).
+The lecture material on data streams begins from the observation that
+the conventional algorithmic assumption that the input fits in memory
+breaks down once observations arrive sequentially in an unbounded or
+very long sequence (Zhang, 2026, lecture W7D2). The lecture's
+examples—uniform sampling from a stream, distinct-element estimation,
+heavy-hitter detection—are abstract by design, and a natural question
+is whether these techniques are useful in practice once one steps away
+from the textbook setting. This project addresses that question for a
+single application area, the daily prices of U.S. equities, and asks
+whether the streaming paradigm can be carried through end-to-end on
+real data with reproducible numerical outputs.
 
-This project applies that paradigm to U.S. equities. Treating five years of
-daily closes as a simulated stream, we build a small Python package that
-reads each observation once and supports five streaming building blocks:
+The application domain is well suited to the question. Although five
+years of daily prices for eight tickers is, in absolute terms, modest
+in size, it is large enough to expose the difference between an
+algorithm whose memory grows with the stream and one whose memory is
+bounded by a small parameter, and small enough that a full-history
+baseline can be computed alongside the streaming algorithms for
+direct comparison. Daily returns, moreover, exhibit the heavy-tailed
+behaviour and irregular event structure for which an adaptive
+threshold-based alert rule is naturally motivated, even if the rule
+itself is descriptive rather than predictive.
 
-1. **Reservoir sampling** — keep a uniform size-`k` sample without storing
-   the full history.
-2. **Heap-based sampling with random tags** — keep the `k` items with the
-   smallest random tags using a bounded heap.
-3. **Online return calculation and rolling-volatility monitoring** —
-   maintain a per-ticker rolling window and compute volatility on the fly.
-4. **Extreme-return event detection** — flag any return exceeding
-   `threshold × rolling_volatility`.
-5. **Top-`k` extreme-return tracking** — maintain a running top-`k` of the
-   largest absolute returns using a min-heap.
+Five streaming components are implemented, each on top of a common
+`StreamItem` interface. Reservoir sampling and heap-based sampling
+with random tags maintain a uniform size-`k` sample of the entire
+history without storing it; the online monitor maintains a per-ticker
+rolling-volatility window and applies a threshold-based extreme-return
+rule for each new observation; and the top-k tracker recovers the `k`
+largest absolute returns ever seen using a bounded min-heap. A
+full-history baseline is computed in parallel as a reference quantity.
+The deliverable is a Python package, `stock_stream`, with thirty-eight
+unit tests, eighty-five per cent branch coverage, and a one-command
+pipeline that regenerates every output from the four raw input files.
 
-A full-history baseline is computed in parallel as a reference for
-checking that selected streaming outputs (per-ticker volatility, the
-top-k absolute returns) behave consistently with the underlying data.
-The deliverable is a Python package (`stock_stream`) with a reproducible
-one-command pipeline, 38 unit tests, and 85 % branch coverage.
+## Chapter 2. Dataset and stream construction
 
----
+The dataset consists of eight Yahoo Finance daily series over the
+common analysis window 2021-04-01 to 2026-04-01: AAPL, ORCL, MSFT,
+AMD, ASML, INTC, META, and NVDA. The raw data was supplied in two
+different download formats. The first, exemplified by
+`ASML_INTC_daily.csv` and `META_NVDA_daily.csv`, is a Yahoo multi-row
+CSV in which the first three rows contain the field name, the ticker
+label, and a placeholder date row, after which one row corresponds to
+one trading day. The second, exemplified by
+`sp500_AAPL_ORCL_stocks.xlsx` and `sp500_MSFT_AMD_stocks.xlsx`, is a
+sheet-per-ticker workbook in which the column structure is already
+flat. The data loader handles both layouts and reduces them to a
+single long-format table whose schema is `date, ticker, open, high,
+low, close, adj_close, volume, ret`. Some files extend slightly beyond
+the project window; observations outside the window are discarded
+before per-ticker returns are computed, so that all eight tickers
+share exactly the same time horizon. Per-ticker daily returns are
+computed as `ret_t = close_t / close_{t-1} − 1`, and the first
+observation for each ticker is therefore missing.
 
-## Chapter 2. Dataset and Stream Construction
+After cleaning, every ticker has 1,256 trading days, and the cleaned
+dataset contains 10,048 rows in total. The use of `adj_close` in the
+schema is preserved for stability across raw layouts, even though the
+multi-row CSV files do not always carry an explicit adjusted-close
+column; in such cases the loader defaults `adj_close` to `close`,
+which is recorded in the schema documentation.
 
-We use eight Yahoo Finance daily series over the common analysis window
-**2021-04-01 → 2026-04-01**:
+## Chapter 3. Problem formulation
 
-`AAPL, ORCL, MSFT, AMD, ASML, INTC, META, NVDA`.
-
-The raw data lives in `data/` and is split across two file formats:
-
-| File | Tickers | Format |
-|------|---------|--------|
-| `ASML_INTC_daily.csv` | ASML, INTC (also QQQ, SPY ignored) | Yahoo multi-row CSV |
-| `META_NVDA_daily.csv` | META, NVDA | Yahoo multi-row CSV |
-| `sp500_AAPL_ORCL_stocks.xlsx` | AAPL, ORCL | sheet-per-ticker XLSX |
-| `sp500_MSFT_AMD_stocks.xlsx` | MSFT, AMD | sheet-per-ticker XLSX |
-
-Some files extend slightly outside the project window. The data loader
-discards any row before 2021-04-01 or after 2026-04-01 so every ticker uses
-exactly the same time horizon.
-
-After cleaning, all eight tickers share the long-format schema
-
-```text
-date, ticker, open, high, low, close, adj_close, volume, ret
-```
-
-and the per-ticker daily return is
-
-```text
-ret_t = close_t / close_{t-1} − 1
-```
-
-The first row for each ticker has `ret = NaN` because no previous close
-exists. The cleaned dataset contains **10 048 rows = 8 tickers × 1 256
-trading days**.
-
----
-
-## Chapter 3. Problem Formulation – Stream Setup
-
-The cleaned dataset is sorted by `(date, ticker)` and replayed as a stream
-of `StreamItem` records:
+The cleaned dataset is sorted by `(date, ticker)` and replayed as a
+stream of `StreamItem` records, defined as
 
 ```python
 @dataclass(frozen=True)
@@ -97,321 +103,344 @@ class StreamItem:
     ret: float | None
 ```
 
-Every downstream component — reservoir sampling, heap sampling, the online
-monitor, and the top-k tracker — consumes the *same* iterator interface,
-which decouples raw file formats from algorithmic logic and makes it
-trivial to swap in a live data feed later.
-
----
+This dataclass is the single contract between the data layer
+(`data_loader`, `stream`) and the algorithmic layer (`reservoir`,
+`heap_sampler`, `monitoring`, `topk`). The motivation for keeping the
+record narrow—four fields rather than the full set of OHLC and volume
+columns—is that the streaming algorithms do not require those columns,
+and reducing the record limits the surface area against which the
+algorithmic interfaces are tied to the present dataset. The same
+`StreamItem` interface would, in principle, accept observations from a
+live websocket feed; everything downstream of `dataframe_to_stream`
+is independent of how the items were produced.
 
 ## Chapter 4. Methods
 
-### 4.1 Full-History Baseline
+### 4.1 Full-history baseline
 
-The baseline reads the cleaned dataset *once*, with random access, and
-computes per-ticker statistics: row count, first and last trading dates,
-min low, max high, mean close, last close, mean return, return volatility
-(`std(ret, ddof=1)`), and `max |ret|`. This is the complete-information
-reference against which all streaming algorithms are validated in
-Chapter 6.
+Before the streaming algorithms are introduced it is convenient to
+record the full-history baseline. The baseline is a simple aggregate
+table, computed by reading the cleaned dataset once with random access
+and producing per-ticker statistics: the number of observations, the
+first and last trading dates, the minimum daily low and the maximum
+daily high, the mean and last close, the mean return, the return
+volatility (the sample standard deviation of returns with `ddof = 1`),
+and the maximum absolute daily return. The baseline is the
+complete-information reference against which the streaming algorithms
+are checked in Chapter 6.
 
-### 4.2 Method 1 – Reservoir Sampling
+### 4.2 Reservoir sampling
 
-Reservoir sampling holds at most `k` items at any time. For the first `k`
-arrivals it inserts directly. For the `n`-th arrival with `n > k`, the
-item is accepted with probability `k / n` and, if accepted, replaces a
-uniformly chosen reservoir slot. After processing `N` items, every observed
-item has equal probability `k / N` of being in the final sample.
+Reservoir sampling holds at most `k` items at any time. For the first
+`k` arrivals it inserts directly into the reservoir; for the `n`-th
+arrival with `n > k`, the item is accepted with probability `k / n`,
+and on acceptance it replaces a uniformly chosen reservoir slot. After
+processing `N` items, every observed item has equal probability `k / N`
+of being in the final sample, by the standard inductive argument that
+combines the inclusion probability of the new item with the
+conditional retention probability of every previously included item.
+The per-item update time is constant in expectation and the storage
+is `O(k)`.
 
-| | |
-|---|---|
-| Per-item update time | `O(1)` expected |
-| Storage | `O(k)` |
+### 4.3 Heap-based sampling with random tags
 
-### 4.3 Method 2 – Heap-Based Sampling with Random Tags
+Heap-based sampling assigns each arrival an independent random tag
+drawn from the uniform distribution on `(0, 1)` and retains the items
+whose tags are the `k` smallest tags seen so far. The retention is
+implemented with a max-heap on the tag of size `k`: when a new item
+arrives, its tag is compared to the heap maximum, and the heap is
+updated only if the new tag is smaller. The retained items form a
+uniform sample without replacement, by the equivalence between
+"select the `k` items with the smallest random priorities" and
+"select `k` items uniformly at random". The per-item update time is
+`O(log k)` and the storage is `O(k)`.
 
-Each arrival is given an independent tag `u ∼ Uniform(0,1)`. A size-`k`
-max-heap keyed on the tag retains the `k` smallest tags seen so far. When a
-new item's tag is smaller than the heap maximum, the heap-top is replaced.
-This is mathematically equivalent to "select the `k` items with the
-smallest random priorities", and yields a uniform sample without
-replacement.
+### 4.4 Online return calculation
 
-| | |
-|---|---|
-| Per-item update time | `O(log k)` |
-| Storage | `O(k)` |
+The cleaned stream already contains `ret`, so the online stage need
+only consume one return per arrival. Items with `ret = None` or `NaN`
+(the first observation per ticker) are skipped because they cannot
+contribute to volatility or alert calculations. This is a small but
+necessary point because, were `NaN` returns silently propagated, the
+rolling sample variance would also be `NaN` and every subsequent alert
+would be either spurious or suppressed depending on the implementation.
 
-### 4.4 Online Return Calculation
+### 4.5 Rolling-volatility monitoring
 
-The cleaned stream already contains `ret`, so the online step only needs to
-*consume* one return per arrival. Items with `ret = None` or `NaN` (the
-first observation per ticker) are silently skipped because they cannot
-contribute to volatility or alert calculations.
-
-### 4.5 Rolling-Volatility Monitoring
-
-For each ticker we maintain a `deque` of the most recent `window_size`
-valid returns (default `window_size = 20`, ≈ one trading month). When the
-window fills, the rolling sample standard deviation (`ddof = 1`) is
-recomputed for every new arrival. Each post-window arrival emits a
-*snapshot* with `(date, ticker, ret, abs_ret, rolling_volatility,
-threshold, is_extreme)`. Per-ticker independence ensures volatilities are
-not contaminated across firms.
+For each ticker the monitor maintains a `deque` of the most recent
+`window_size` valid returns; the default window is 20, which is
+approximately one trading month. While the window is filling, no
+snapshot is emitted. Once the window is full, the rolling sample
+standard deviation, with `ddof = 1`, is recomputed for every
+subsequent valid return, and the monitor emits a snapshot containing
+the date, the ticker, the return and its absolute value, the rolling
+volatility, the threshold parameter, and the extreme-event flag. Each
+ticker has its own window, so the volatilities of the eight tickers
+are not mixed.
 
 #### Volatility-window convention
 
-Two natural designs exist:
+Two natural designs exist. In the *state-after-event* convention,
+which is the one used here, the new return is appended to the window
+first, the volatility is then recomputed, and the rule is finally
+evaluated; the volatility used for the rule therefore includes the
+current return, and the emitted snapshot is best read as the state of
+the monitor after the event has been processed. In the
+*state-before-event* convention, sometimes called a leave-one-out
+detector, only the previous window is used to score the current
+return, and the window is updated afterwards; the score is then
+independent of the value being scored. The literature on anomaly
+detection sometimes prefers the second formulation for that reason.
+We adopted the first because it is simpler and because, with a window
+of twenty observations and a three-sigma threshold, the two
+formulations disagree only at the boundary of the threshold and on at
+most a handful of events; the substantive findings of Chapter 6 do
+not depend on which is chosen. Switching conventions would require
+swapping two lines in `monitoring.py:update` and is therefore a clean
+extension rather than a bug fix.
 
-1. **State-after-event** (the convention used here). Append the new
-   return to the window first, then recompute volatility, then evaluate
-   the rule. The volatility used for the rule includes the current
-   return. The snapshot is interpreted as *the state of the monitor
-   after processing this event*.
-2. **State-before-event** ("leave-one-out"). Use only the previous
-   window to score the current return; update the window afterwards.
+### 4.6 Extreme-return event detection
 
-Design 2 is sometimes preferred for anomaly-detection writeups because
-the score is independent of the value being scored. Design 1 is simpler
-and is the convention adopted by `OnlineMonitor`. With `window_size = 20`
-and `threshold = 3 σ`, the two designs disagree on at most a handful of
-events near the boundary; the substantive findings (e.g. the META
-2022-02-03 and ORCL 2025-09-10 alerts) are unchanged. Switching
-conventions would require swapping two lines in `monitoring.py:update`
-and is a clean extension rather than a bug fix.
-
-### 4.6 Extreme-Return Event Detection
-
-A snapshot is flagged as **extreme** when
+A snapshot is flagged as extreme when the absolute return exceeds the
+threshold multiplied by the rolling volatility, that is, when
 
 ```text
-|ret_t| > threshold × rolling_volatility_t
+|ret_t| > threshold × rolling_volatility_t,
 ```
 
-with default `threshold = 3.0`. The rule is *adaptive*: a 3 % return is
-extreme during a calm regime but routine during a turbulent one. All
-flagged events are written to `outputs/monitoring_alerts.csv`.
+with the default threshold equal to three. The rule is adaptive in
+the relevant sense: a return of a given magnitude is more likely to
+be flagged during a calm regime, when the rolling volatility is low,
+than during a turbulent one, when the rolling volatility is high.
+Each flagged event is also written to `outputs/monitoring_alerts.csv`
+in addition to appearing in the snapshot table.
 
-### 4.7 Top-`k` Extreme-Return Tracking
+### 4.7 Top-k extreme-return tracking
 
-To recover the largest absolute returns over the entire stream without
-storing the entire stream, we keep a bounded **min-heap** of size `k`
-keyed on `abs_ret`. When the heap is full and a new arrival's `abs_ret`
-exceeds the heap minimum, we replace it. At the end the heap is sorted in
-descending order to produce a ranked top-`k` table.
+To recover the `k` largest absolute returns over the entire stream
+without storing the entire stream, the tracker maintains a bounded
+min-heap of size `k` keyed on the absolute return. While the heap has
+fewer than `k` entries, the tracker inserts each new arrival; once
+the heap is full, the tracker compares the absolute return of the
+arrival with the heap minimum and replaces the minimum only if the
+arrival is larger. At the end of the stream the heap is sorted in
+descending order to produce a ranked top-k table. The per-item update
+time is `O(log k)` and the storage is `O(k)`. Unlike reservoir and
+heap-based sampling, this algorithm is deterministic, in the sense
+that for a fixed input stream the output is unique.
 
-| | |
-|---|---|
-| Per-item update time | `O(log k)` |
-| Storage | `O(k)` |
-
----
-
-## Chapter 5. Implementation Design
+## Chapter 5. Implementation
 
 ### 5.1 Package layout
+
+The package is laid out following the standard `src/`-layout convention:
 
 ```text
 stock_stream_pipeline_final/
 ├── data/                          raw inputs (csv + xlsx)
 ├── src/stock_stream/              package source
 │   ├── types.py                   StreamItem dataclass
-│   ├── data_loader.py             format-aware loader + windowing
+│   ├── data_loader.py             format-aware loader and windowing
 │   ├── stream.py                  dataframe_to_stream / preview_stream
 │   ├── baseline.py                full-history baseline
 │   ├── reservoir.py               reservoir sampling
 │   ├── heap_sampler.py            heap-based sampling
-│   ├── sampling_evaluation.py     correctness / runtime / memory
+│   ├── sampling_evaluation.py     empirical check, runtime, memory
 │   ├── monitoring.py              OnlineMonitor (rolling vol + alerts)
 │   └── topk.py                    TopKExtremeReturns
 ├── scripts/                       runnable entry points
 ├── tests/                         pytest suite (38 tests)
-├── outputs/                       generated artifacts
-└── docs/                          this report and per-chapter drafts
+├── outputs/                       generated artefacts
+└── docs/                          this report and the per-chapter drafts
 ```
 
-### 5.2 Module dependency graph
+The `StreamItem` interface is the single point of contact between the
+data layer (`data_loader`, `stream`) and the algorithmic layer
+(`reservoir`, `heap_sampler`, `monitoring`, `topk`). The
+`sampling_evaluation` module is logically part of the algorithmic
+layer; `baseline` belongs to neither and operates directly on the
+cleaned dataframe.
 
-```text
-types ─────► stream ─────► sampling_evaluation
-   │            │              │
-   │            ▼              ▼
-   ├──► baseline             reservoir, heap_sampler
-   │
-   └──► monitoring, topk
-            ▲
-            │
-       data_loader (raw csv/xlsx → cleaned dataframe → stream)
-```
+### 5.2 Entry-point scripts
 
-The unified `StreamItem` interface is the single contract between the data
-layer (`data_loader`, `stream`) and the algorithmic layer (`reservoir`,
-`heap_sampler`, `monitoring`, `topk`).
-
-### 5.3 Entry-point scripts
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/run_step1_pipeline.py` | raw → clean dataset, baseline, stream preview |
-| `scripts/run_sampling_evaluation.py` | correctness, runtime, memory experiments |
-| `scripts/run_monitoring.py` | snapshots, alerts, top-k |
-| `scripts/run_validation_comparison.py` | cross-checks + four diagnostic plots |
-| `scripts/run_full_pipeline.py` | runs all four stages in one command |
-
----
+The four pipeline stages are provided as standalone scripts, and a
+fifth script runs all four in sequence. The first stage,
+`scripts/run_step1_pipeline.py`, loads the raw files, applies the
+window, computes per-ticker returns, and writes the cleaned dataset,
+the full-history baseline, and a twelve-row stream preview. The
+second, `scripts/run_sampling_evaluation.py`, runs the correctness,
+runtime, and memory experiments described in Chapter 6 and writes the
+five output tables. The third, `scripts/run_monitoring.py`, runs the
+online monitor and the top-k tracker over the cleaned stream and
+writes the snapshot table, the alert table, and the ranked top-k
+table. The fourth, `scripts/run_validation_comparison.py`, compares
+the streaming outputs against the baseline and writes four diagnostic
+plots. The combined runner, `scripts/run_full_pipeline.py`, simply
+invokes the four stages in order; on a recent Apple-silicon laptop it
+completes in under five seconds end-to-end.
 
 ## Chapter 6. Experiments
 
 ### 6.1 Empirical sampling check
 
-Both reservoir and heap sampling are *randomized* algorithms; their
-guarantee is at the level of the inclusion *distribution*, not on any
-single run. To check this empirically, for each method we run 500
-independent samples of size `k = 50` over the cleaned stream of length
-`N = 10 048` and count how often each observation is selected.
+Both reservoir and heap-based sampling are randomised algorithms;
+their guarantee is at the level of the inclusion *distribution*, not
+on any single run. To verify this empirically we ran 500 independent
+samples of size `k = 50` over the cleaned stream of length
+`N = 10,048` and counted the number of times each observation
+appeared in the final sample. The expected per-item inclusion
+probability under uniform sampling is `k / N ≈ 4.976 × 10⁻³`.
 
-| Method | `k / N` (theory) | mean selection prob (empirical) | std of per-item prob |
+| Method | `k / N` (theoretical) | Mean empirical inclusion probability | Standard deviation across items |
 |---|---:|---:|---:|
 | Reservoir | 0.004976 | 0.004976 | 0.003155 |
 | Heap | 0.004976 | 0.004976 | 0.003110 |
 
-Both empirical means match the theoretical value to six decimals, and
-the per-item standard deviation is consistent with the finite-sample
-binomial noise that a uniform sampler would produce. This is consistent
-with — but, by construction, not a *proof* of — uniformity; the formal
-guarantees come from the inductive arguments sketched in the lecture.
+The empirical means recover the theoretical value to six decimal
+places, and the per-item standard deviation is consistent with the
+binomial noise that a uniform sampler would produce in 500 runs. The
+result is consistent with—but, by construction, not a proof of—
+uniformity; the formal guarantees come from the inductive arguments
+sketched in the lecture and rehearsed in Chapter 4.
 
-Outputs: `sampling_correctness_frequencies.csv`,
-`sampling_correctness_summary.csv`.
+### 6.2 Runtime
 
-### 6.2 Runtime comparison
+Stream lengths of 1,000, 10,000, and 10,048 were combined with sample
+sizes of 10, 50, and 100, with five repetitions per configuration:
 
-Stream lengths `N ∈ {1 000, 10 000, 10 048}`, sample sizes
-`k ∈ {10, 50, 100}`, 5 repeats per configuration.
+| `N` | `k` | Reservoir mean (ms) | Heap mean (ms) |
+|------:|-----:|--------------------:|---------------:|
+| 1,000 | 10 | 0.26 | 0.08 |
+| 1,000 | 100 | 0.26 | 0.11 |
+| 10,000 | 10 | 2.54 | 0.57 |
+| 10,000 | 100 | 2.57 | 0.66 |
 
-| `N` | `k` | reservoir mean (ms) | heap mean (ms) |
-|------:|-----:|---------------------:|---------------:|
-| 1 000 | 10 | 0.26 | 0.08 |
-| 1 000 | 100 | 0.26 | 0.11 |
-| 10 000 | 10 | 2.54 | 0.57 |
-| 10 000 | 100 | 2.57 | 0.66 |
+At the scale of the present stream the heap-based sampler is, in
+absolute terms, roughly four times faster than the reservoir sampler,
+even though its asymptotic per-item cost (`O(log k)`) is worse. The
+reason is constant factors. Reservoir sampling, in the implementation
+used here, makes two calls to the random-number generator per
+accepted item (once to draw the acceptance probability and once to
+choose the slot to replace); heap-based sampling makes only one
+random draw per arrival and an occasional `heapreplace`. The
+asymptotic ranking would still favour reservoir for very large `k`,
+but in the streaming regime the project is designed for, where `k`
+is small and bounded, heap-based sampling is the more practical
+choice in pure Python.
 
-The heap-based sampler is ~4× faster in absolute wall-clock time at this
-scale even though its asymptotic per-item cost (`O(log k)`) is *worse*
-than the reservoir sampler's (`O(1)` expected). The reason is constant
-factors: reservoir sampling calls `rng.randint` and `rng.randrange`
-twice per accepted item, while the heap sampler does one `rng.random`
-plus an occasional `heapreplace`.
+### 6.3 Memory
 
-The asymptotic ranking would still favour reservoir for very large `k`,
-but in the realistic streaming regime (`k` bounded, `N` huge) heap
-sampling is competitive in Python.
+Peak memory was measured using `tracemalloc`:
 
-Output: `sampling_runtime_comparison.csv`.
+| Method | `k` | Peak memory (bytes) |
+|---|---:|---:|
+| Full-history baseline | — | 80,440 |
+| Reservoir | 10 | 3,332 |
+| Reservoir | 100 | 4,068 |
+| Heap | 10 | 3,552 |
+| Heap | 100 | 8,480 |
 
-### 6.3 Memory comparison
-
-| Method | `k` | peak memory (B) |
-|--------|----:|------------------:|
-| full-history baseline | — | 80 440 |
-| reservoir | 10 | 3 332 |
-| reservoir | 100 | 4 068 |
-| heap | 10 | 3 552 |
-| heap | 100 | 8 480 |
-
-Both streaming samplers use **20–25× less peak memory** than the
-full-history baseline, and reservoir's footprint grows much more slowly
-in `k` than heap's because the heap stores three extra fields per slot
-(tag, order, item).
-
-Output: `sampling_memory_comparison.csv`.
+The streaming samplers use roughly one twentieth to one twenty-fifth
+of the memory of the full-history baseline. Within the streaming
+samplers, reservoir's footprint grows much more slowly in `k` than
+heap's because the heap entry stores the random tag and the arrival
+order alongside the item itself.
 
 ### 6.4 Online-monitoring experiment
 
-Window 20, threshold 3.0. The monitor processed the entire stream in one
-pass and produced **9 888 snapshots and 96 alerts**. The first 19 returns
-per ticker (8 × 19 = 152) are used to fill the rolling window and do not
-emit snapshots, which explains the gap from 10 048.
+With `window_size = 20` and `threshold = 3.0`, the monitor processed
+the entire cleaned stream in a single pass, emitted 9,888 snapshots,
+and flagged 96 alerts. The 152-snapshot deficit between the stream
+length and the snapshot count corresponds exactly to the eight
+per-ticker windows of nineteen observations that are required to
+fill the rolling buffer before snapshots begin to be emitted, which
+is the expected behaviour.
 
-Examples of detected extreme events (full list in
-`outputs/monitoring_alerts.csv`):
+A short selection of the largest detected events, with the rolling
+volatility used in the rule, illustrates the alignment with widely
+reported public events:
 
-| date | ticker | ret | rolling vol | comment |
-|------|--------|-----:|-------------:|---------|
-| 2025-09-10 | ORCL | +0.359 | 0.085 | cloud-AI guidance surprise |
+| Date | Ticker | Return | Rolling volatility | Public event |
+|---|---|---:|---:|---|
+| 2025-09-10 | ORCL | +0.359 | 0.085 | cloud and AI revenue guidance |
 | 2022-02-03 | META | −0.264 | 0.063 | Q4 2021 earnings miss |
-| 2024-08-02 | INTC | −0.261 | 0.064 | Q2 2024 guidance + dividend cut |
+| 2024-08-02 | INTC | −0.261 | 0.064 | Q2 2024 guidance and dividend cut |
 | 2022-10-27 | META | −0.246 | 0.061 | Q3 2022 earnings |
 | 2023-05-25 | NVDA | +0.244 | 0.058 | AI-driven guidance raise |
 
-The histogram in `outputs/plots/alert_magnitudes_hist.png` shows most
-alerts cluster in `|ret| ∈ [0.04, 0.16]` with a heavy right tail. The
-volatility scatter in `outputs/plots/volatility_scatter.png` shows that
-the average rolling volatility is consistently slightly *below* the
-full-history volatility (mean ratio ≈ 0.92), as expected: a 20-day window
-under-weights the rare full-period blow-ups.
+The rolling-volatility histogram in
+`outputs/plots/rolling_volatility_hist.png` shows that the bulk of
+the snapshot volatilities lie between roughly 0.015 and 0.030, with a
+right tail extending past 0.05 that corresponds to the high-volatility
+regimes around the events listed above. The cross-ticker scatter in
+`outputs/plots/volatility_scatter.png` shows that the average rolling
+volatility is, for every ticker, slightly below the full-history
+volatility (the mean ratio is about 0.92), which is the expected
+consequence of a sliding window under-weighting the rare full-period
+shocks that contribute disproportionately to the unconditional
+sample standard deviation.
 
-### 6.5 Top-`k` experiment
+### 6.5 Top-k experiment
 
-`k = 10`. The bounded heap returns the same 10 events that the
-full-history baseline's `max |ret|` per ticker would return — the
-scatter in `outputs/plots/topk_vs_baseline_scatter.png` lies exactly on
-the 45° line, with **max deviation 0.000000** across the five tickers
-that contributed to the top 10. AAPL, ASML, MSFT did not place any
-observation in the global top 10 (their per-ticker maxima are smaller),
-which is consistent with the baseline's `max_abs_return` ranking.
+With `k = 10`, the bounded min-heap recovered the same ten events as
+the per-ticker maxima of the full-history baseline; the
+top-k-versus-baseline scatter in
+`outputs/plots/topk_vs_baseline_scatter.png` lies exactly on the
+forty-five-degree line, with a maximum deviation across the five
+contributing tickers of zero. AAPL, ASML, and MSFT did not place an
+observation in the global top ten because their per-ticker maxima
+were smaller than the tenth-largest event in the global ranking,
+which is consistent with the values in `full_history_baseline.csv`.
+This match should be read as confirmation, not as surprise: the
+top-k tracker is a deterministic selection rule, and an exact match
+to the baseline is the expected outcome.
 
-Output: `outputs/topk_extreme_returns.csv`.
-
----
-
-## Chapter 7. Unit Testing and Reproducibility
+## Chapter 7. Tests and reproducibility
 
 ### 7.1 Test suite
 
-The 38-test suite (`tests/`) covers every public function and every error
-path:
-
-| Module | Tests | What is verified |
-|--------|------:|------------------|
-| `data_loader.py` | 3 | format-aware loading, project window, equal rows per ticker |
-| `stream.py` / `baseline.py` | 4 | chronological order, return computation, baseline shape, project window constants |
-| `reservoir.py` / `heap_sampler.py` / `sampling_evaluation.py` | 7 | exact-`k` output, short-stream behaviour, `k = 0`, `k < 0` error, correctness/runtime/memory schemas |
-| `monitoring.py` | 11 | window-fill behaviour, vol formula, threshold rule, ticker independence, NaN/None handling, dataframe schemas, reset, init validation |
-| `topk.py` | 13 | partial fill, ranking, sign symmetry, NaN/None handling, replacement rule, reset, init validation |
-
-Run:
-
-```bash
-pytest                              # 38 passed
-coverage run -m pytest && coverage report
-```
+The tests are organised by module. Three tests cover the data loader,
+verifying that each raw layout yields the expected tickers, that the
+project window is enforced, and that the per-ticker row counts are
+equal after windowing. Four tests cover the stream and baseline
+modules, verifying chronological order, return computation, baseline
+shape, and the project window constants. Seven tests cover the two
+samplers and the sampling-evaluation helpers, checking exact-`k`
+output, behaviour on streams shorter than `k`, the `k = 0` and `k < 0`
+boundaries, and the schema of the correctness, runtime, and memory
+tables. Eleven tests cover the online monitor, checking that no
+snapshot is emitted before the window fills, that the rolling
+volatility matches the analytical value, that the threshold rule is
+respected in both directions, that tickers do not interfere, that
+`None` and `NaN` returns are skipped, that the snapshot and alert
+dataframes have the expected schema, that the reset method works, and
+that the constructor rejects invalid arguments. Thirteen tests cover
+the top-k tracker, checking partial-fill behaviour, the ranking rule,
+sign symmetry, the handling of `None` and `NaN`, the replacement rule
+in both directions, the empty-tracker behaviour, the handling of
+duplicate absolute values, the reset method, and the constructor's
+validation. The total is thirty-eight tests, all of which pass under
+`pytest` with no warnings.
 
 ### 7.2 Coverage
 
-Branch coverage is **85 %** overall, exceeding the project's 80 % target:
+Coverage was measured with `coverage` in branch mode after running
+the test suite. The overall branch coverage is eighty-five per cent,
+above the eighty-per-cent threshold suggested in the project rubric.
+The algorithmic modules—`reservoir`, `heap_sampler`, `monitoring`,
+and `topk`—are at one hundred per cent. The lower coverage of
+`baseline`, `data_loader`, and `sampling_evaluation` is attributable
+to file-writing helpers and the experiment-driver loops, which are
+exercised end-to-end by the pipeline scripts but are not the subject
+of separate unit tests. Concentrating coverage on the algorithmic
+core is, we would argue, the appropriate emphasis: that is the part
+of the package whose correctness is most consequential, and it is
+the part that most directly implements the lecture material.
 
-```text
-Name                                Stmts  Miss Branch BrPart  Cover
-src/stock_stream/__init__.py            8     0      0      0   100%
-src/stock_stream/baseline.py           17     6      2      0    68%
-src/stock_stream/data_loader.py       103    17     30      9    80%
-src/stock_stream/heap_sampler.py       22     0     10      0   100%
-src/stock_stream/monitoring.py         51     0     16      0   100%
-src/stock_stream/reservoir.py          21     0     10      0   100%
-src/stock_stream/sampling_evaluation.py 101  32     32      1    66%
-src/stock_stream/stream.py             17     0      6      1    96%
-src/stock_stream/topk.py               38     0     14      0   100%
-src/stock_stream/types.py               8     0      0      0   100%
-TOTAL                                 386    55    120     11    85%
-```
+### 7.3 Reproducibility
 
-Algorithmic modules (`reservoir`, `heap_sampler`, `monitoring`, `topk`)
-are at 100 % branch coverage; the lower-coverage modules consist of CSV/
-XLSX writer paths and large experiment-driver loops that are exercised
-end-to-end by the pipeline scripts but not in isolated unit tests.
-
-### 7.3 One-command reproducibility
+The full pipeline is reproducible in a clean environment with three
+commands:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -419,81 +448,83 @@ pip install -r requirements.txt
 python scripts/run_full_pipeline.py
 ```
 
-The full pipeline regenerates **every** CSV, XLSX, JSON, and PNG in
-`outputs/` from the four raw files in `data/` in under five seconds on a
-laptop.
+Every cleaned table, every experiment table, every alert and top-k
+record, and every figure in `outputs/` is regenerated from the four
+raw input files in `data/` in under five seconds on a recent laptop.
 
----
+## Chapter 8. Findings
 
-## Chapter 8. Results
-
-1. **Sampling is empirically uniform and cheap.** Across 500 runs, both
-   reservoir and heap sampling match the theoretical inclusion
-   probability `k/N` to six decimals, and both use 20–25× less memory
-   than the full-history baseline.
-2. **Heap is faster in practice, reservoir is leaner.** At `N = 10 000`
-   the heap sampler is roughly 4× faster in wall-clock terms despite a
-   larger asymptotic constant; reservoir keeps a smaller and slower-growing
-   memory footprint.
-3. **Online monitoring matches well-known events.** The 96 alerts include
-   the META 2022-02-03 earnings drop, the INTC 2024-08-02 guidance cut,
-   the NVDA 2023-05-25 guidance beat, and the ORCL 2025-09-10 cloud-AI
-   surprise — every one of these is a real news event that triggered a
-   ≥ 3σ daily move.
-4. **Top-`k` matches the baseline.** The bounded heap recovers the same
-   10 largest absolute-return events as the full-history baseline (zero
-   deviation across the five tickers contributing to the global top 10),
-   while using O(`k`) instead of O(`N`) memory. Note that this is a
-   *deterministic* selection rule, not a randomized sampler, so an exact
-   match is the expected outcome.
-5. **Average rolling volatility runs ≈ 8 % below baseline volatility.**
-   This is consistent with the sliding window under-weighting rare,
-   full-period shocks.
-
----
+The substantive findings can be summarised in four points. The first
+is that the two randomised samplers are, within the precision of 500
+runs, empirically uniform: the mean per-item inclusion probability
+matches the theoretical `k / N` value to six decimal places for both
+methods, and the per-item dispersion is consistent with binomial
+noise. The second is that, in the streaming regime that the project
+addresses, the heap-based sampler is roughly four times faster in
+absolute wall-clock terms than the reservoir sampler, even though
+its asymptotic per-item cost is the larger of the two; the
+implication is that the choice between the two methods, in pure
+Python and at moderate `k`, is governed by constant factors rather
+than asymptotics. The third is that both streaming samplers reduce
+peak memory by a factor of roughly twenty to twenty-five compared
+with the full-history baseline, and that reservoir's footprint grows
+more slowly in `k` than heap's, consistent with the heap's per-entry
+overhead. The fourth is that the online monitor's alert events
+align with widely reported public news (the META 2022-02-03 and
+2022-10-27 earnings drops, the INTC 2024-08-02 guidance cut, the
+ORCL 2025-09-10 cloud and AI guidance, the NVDA 2023-05-25 AI
+guidance raise, and so on); the bounded top-k tracker, in turn,
+recovers the same ten events as the per-ticker maxima of the
+full-history baseline, which is the expected behaviour of a
+deterministic selection rule.
 
 ## Chapter 9. Limitations
 
-- **Daily granularity only.** The pipeline assumes a fixed, regular
-  cadence. Tick-level or irregular streams would require time-weighted
-  rolling statistics.
-- **Threshold-based alerts** are simple and adaptive but can produce
-  clusters of alerts during regime shifts (e.g. earnings week). A
-  cooldown or volatility-of-volatility rule could reduce noise.
-- **Single random tag per item** for heap sampling — to support sampling
-  with replacement or weighted sampling we would need a different priority
-  function (e.g. the A-Res algorithm).
-- **No live feed.** The streaming behaviour is *simulated* by replaying a
-  cleaned dataframe in date order. A real production deployment would
-  swap `dataframe_to_stream` for a websocket/Kafka adapter; everything
-  downstream stays unchanged thanks to the `StreamItem` interface.
-
----
+Several limitations follow from the choices that were made and
+should be acknowledged. The pipeline assumes a regular daily
+cadence; tick-level or otherwise irregular streams would require a
+time-weighted version of the rolling statistic and an event-time
+rather than count-time window. The threshold-based alert rule is
+adaptive but blunt: in regime shifts such as earnings weeks it can
+produce clusters of alerts on consecutive days, and a richer rule
+incorporating, for example, a cooldown or a volatility-of-volatility
+adjustment would reduce that clustering. The heap-based sampler uses
+a single random tag per item, which is sufficient for sampling
+without replacement at uniform weights but would have to be replaced
+by a different priority function to support sampling with
+replacement or weighted sampling along the lines of the A-Res
+algorithm. Finally, the streaming behaviour in this project is
+simulated rather than live: the cleaned dataframe is replayed in
+date order through the `dataframe_to_stream` adapter, and a true
+production deployment would require swapping that adapter for a
+websocket or message-bus reader. The downstream interfaces do not
+need to change, which was a principal motivation for keeping
+`StreamItem` narrow.
 
 ## Chapter 10. Conclusion
 
-The project closes the loop between the lecture material on data streams
-and a reproducible quantitative-finance pipeline that is *not* a
-prediction or trading system: every component is a streaming data-
-structure exercise applied to real equity data. We implemented both
-classical streaming-sampling algorithms, a per-ticker rolling-volatility
-monitor, a threshold-based extreme-return alert rule, and a bounded
-top-`k` tracker, all on top of a single `StreamItem` interface. The
-randomized samplers behave empirically as the theory predicts (mean
-inclusion probability matches `k/N` to six decimals over 500 runs); the
-deterministic top-`k` tracker recovers the same global top-10 events as
-the full-history baseline; and all four streaming components run in
-memory bounded by `k` or `window_size` rather than by `N`, validating
-the data-stream paradigm on five years of U.S. equity data. The package
-ships with 38 unit tests and 85 % branch coverage, and the entire
-deliverable can be regenerated with a single command from raw inputs.
+This project set out to ask whether the streaming paradigm covered in
+the lecture is worthwhile in practice once one steps away from the
+textbook setting and onto a real, if modest, dataset. The answer
+suggested by the experiments above is that it is, in three concrete
+respects: the streaming samplers are empirically uniform and reduce
+peak memory by an order of magnitude relative to the full-history
+baseline; the online monitor recovers, with a single descriptive
+statistic and a single threshold, a list of events that aligns with
+well-known public news; and the bounded top-k tracker recovers the
+same extreme events as the full-history baseline while using O(`k`)
+rather than O(`N`) memory. None of these results is a forecast or a
+trading signal, and the project does not claim to be one. What it
+does claim is that the streaming paradigm—understood narrowly as a
+collection of bounded-memory, single-pass data structures—can be
+carried through end-to-end on five years of real U.S. equity data
+with reproducible numerical outputs, thirty-eight passing tests, and
+eighty-five-per-cent branch coverage.
 
----
+## Appendix A. File-to-chapter map
 
-## Appendix A. File-to-Chapter Map
-
-| Code / data file | Chapter |
-|------------------|---------|
+| Code or data file | Chapter |
+|---|---|
 | `data/*.csv`, `data/*.xlsx` | 2 |
 | `src/stock_stream/data_loader.py`, `stream.py`, `types.py` | 2, 3 |
 | `src/stock_stream/baseline.py` | 4.1 |
@@ -502,7 +533,7 @@ deliverable can be regenerated with a single command from raw inputs.
 | `src/stock_stream/monitoring.py` | 4.4, 4.5, 4.6 |
 | `src/stock_stream/topk.py` | 4.7 |
 | `src/stock_stream/sampling_evaluation.py` | 6.1, 6.2, 6.3 |
-| `scripts/run_*` | 5.3 |
+| `scripts/run_*` | 5.2 |
 | `tests/*` | 7 |
 | `outputs/full_history_baseline.csv` | 4.1, 6.5 |
 | `outputs/sampling_correctness_*.csv` | 6.1 |
@@ -512,3 +543,8 @@ deliverable can be regenerated with a single command from raw inputs.
 | `outputs/monitoring_alerts.csv` | 4.6, 6.4 |
 | `outputs/topk_extreme_returns.csv` | 4.7, 6.5 |
 | `outputs/plots/*.png` | 6.4, 6.5 |
+
+## References
+
+Zhang, Z. (2026). *Data Streams.* W7D2 lecture, ORIE 5270, Cornell
+University, Spring 2026.
